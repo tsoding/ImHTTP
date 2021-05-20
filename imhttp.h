@@ -82,7 +82,7 @@ void imhttp_req_begin(ImHTTP *imhttp, ImHTTP_Method method, const char *resource
     imhttp_write_cstr(imhttp, " ");
     // TODO: it is easy to make the resource malformed in imhttp_req_begin
     imhttp_write_cstr(imhttp, resource);
-    imhttp_write_cstr(imhttp, " HTTP/1.0\r\n");
+    imhttp_write_cstr(imhttp, " HTTP/1.1\r\n");
 }
 
 void imhttp_req_header(ImHTTP *imhttp, const char *header_name, const char *header_value)
