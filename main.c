@@ -15,7 +15,9 @@
 #define IMHTTP_IMPLEMENTATION
 #include "./imhttp.h"
 
-#define HOST "tsoding.org"
+// http://anglesharp.azurewebsites.net/Chunked
+
+#define HOST "anglesharp.azurewebsites.net"
 #define PORT "80"
 
 ssize_t imhttp_write(ImHTTP_Socket socket, const void *buf, size_t count)
@@ -66,7 +68,7 @@ int main()
     };
     imhttp.socket = (void*) (int64_t) sd,
 
-    imhttp_req_begin(&imhttp, IMHTTP_GET, "/index.html");
+    imhttp_req_begin(&imhttp, IMHTTP_GET, "/Chunked");
     {
         imhttp_req_header(&imhttp, "Host", HOST);
         imhttp_req_header(&imhttp, "Foo", "Bar");
