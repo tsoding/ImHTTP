@@ -15,27 +15,23 @@ typedef enum {
     IMHTTP_POST,
 } ImHTTP_Method;
 
-#define IMHTTP_RES_META_CAPACITY (8 * 1024)
-#define IMHTTP_RES_BODY_CHUNK_CAPACITY IMHTTP_RES_META_CAPACITY
+#define IMHTTP_ROLLIN_BUFFER_CAPACITY (8 * 1024)
+#define IMHTTP_USER_BUFFER_CAPACITY IMHTTP_ROLLIN_BUFFER_CAPACITY
 
-static_assert(IMHTTP_RES_META_CAPACITY <= IMHTTP_RES_BODY_CHUNK_CAPACITY,
-              "If we overshoot and read a part of the body into meta data "
-              "buffer, we want that \"tail\" to actually fit into the "
-              "res_body_chunk");
+static_assert(IMHTTP_ROLLIN_BUFFER_CAPACITY <= IMHTTP_USER_BUFFER_CAPACITY,
+              "The user buffer should be at least as big as the rolling buffer "
+              "because sometimes you may wanna put the whole rollin content into "
+              "the user buffer.");
 
 typedef struct {
     ImHTTP_Socket socket;
     ImHTTP_Write write;
     ImHTTP_Read read;
 
-    char res_meta[IMHTTP_RES_META_CAPACITY];
-    size_t res_meta_size;
+    char rollin_buffer[IMHTTP_ROLLIN_BUFFER_CAPACITY];
+    size_t rollin_buffer_size;
 
-    String_View meta_cursor;
-
-    bool first_chunk;
-    char res_body_chunk[IMHTTP_RES_BODY_CHUNK_CAPACITY];
-    size_t res_body_chunk_size;
+    char user_buffer[IMHTTP_USER_BUFFER_CAPACITY];
 
     int content_length;
 } ImHTTP;
@@ -56,6 +52,49 @@ void imhttp_res_end(ImHTTP *imhttp);
 #endif // IMHTTP_H_
 
 #ifdef IMHTTP_IMPLEMENTATION
+
+static String_View imhttp_shift_rollin_buffer(ImHTTP *imhttp, const char *end)
+{
+    // Boundary check
+    assert(imhttp->rollin_buffer <= end);
+    size_t n = end - imhttp->rollin_buffer;
+    assert(n <= imhttp->rollin_buffer_size);
+
+    // Copy chunk to user buffer
+    assert(n <= IMHTTP_USER_BUFFER_CAPACITY);
+    memcpy(imhttp->user_buffer, imhttp->rollin_buffer, n);
+
+    // Shifting the rollin buffer
+    imhttp->rollin_buffer_size -= n;
+    memmove(imhttp->rollin_buffer, end, imhttp->rollin_buffer_size);
+
+    return (String_View) {
+        .data = imhttp->user_buffer,
+        .count = n,
+    };
+}
+
+// TODO: document that imhttp_top_rollin_buffer does not perform any reads until *everything* inside of rollin_buffer is processed
+static void imhttp_top_rollin_buffer(ImHTTP *imhttp)
+{
+    if (imhttp->rollin_buffer_size == 0) {
+        ssize_t n = imhttp->read(
+                        imhttp->socket,
+                        imhttp->rollin_buffer + imhttp->rollin_buffer_size,
+                        IMHTTP_ROLLIN_BUFFER_CAPACITY - imhttp->rollin_buffer_size);
+        // TODO: imhttp_top_rollin_buffer() does not handle read errors
+        assert(n > 0);
+        imhttp->rollin_buffer_size += n;
+    }
+}
+
+static String_View imhttp_rollin_buffer_as_sv(ImHTTP *imhttp)
+{
+    return (String_View) {
+        .data = imhttp->rollin_buffer,
+        .count = imhttp->rollin_buffer_size,
+    };
+}
 
 static const char *imhttp_method_as_cstr(ImHTTP_Method method)
 {
@@ -113,65 +152,47 @@ void imhttp_req_end(ImHTTP *imhttp)
     (void) imhttp;
 }
 
-static void imhttp_res_springback_meta(ImHTTP *imhttp)
-{
-    String_View sv = {
-        .count = imhttp->res_meta_size,
-        .data = imhttp->res_meta
-    };
-
-    while (sv.count > 0) {
-        String_View line = sv_chop_by_delim(&sv, '\n');
-
-        if (sv_eq(line, SV("\r"))) {
-            memcpy(imhttp->res_body_chunk, sv.data, sv.count);
-            imhttp->res_body_chunk_size = sv.count;
-            assert(imhttp->res_meta < sv.data);
-            imhttp->res_meta_size = sv.data - imhttp->res_meta;
-            imhttp->first_chunk = true;
-            return;
-        }
-    }
-
-    assert(0 && "IMHTTP_RES_META_CAPACITY is too small");
-}
-
 void imhttp_res_begin(ImHTTP *imhttp)
 {
     // Reset the Content-Length
     imhttp->content_length = -1;
-
-    // Read response Meta Data
-    {
-        ssize_t n = imhttp->read(imhttp->socket, imhttp->res_meta, IMHTTP_RES_META_CAPACITY);
-        // TODO: imhttp_res_begin does not hande read errors
-        assert(n > 0);
-        imhttp->res_meta_size = n;
-        imhttp_res_springback_meta(imhttp);
-
-        imhttp->meta_cursor = (String_View) {
-            .count = imhttp->res_meta_size,
-            .data = imhttp->res_meta
-        };
-    }
 }
 
 uint64_t imhttp_res_status_code(ImHTTP *imhttp)
 {
-    String_View status_line = sv_chop_by_delim(&imhttp->meta_cursor, '\n');
+    imhttp_top_rollin_buffer(imhttp);
+    String_View rollin = imhttp_rollin_buffer_as_sv(imhttp);
+    String_View status_line = sv_chop_by_delim(&rollin, '\n');
+    assert(
+        sv_ends_with(status_line, SV("\r")) &&
+        "The rolling buffer is so small that it could not fit the whole status line. "
+        "Or maybe the status line was not fully read after the imhttp_top_rollin_buffer() "
+        "above");
+    status_line = imhttp_shift_rollin_buffer(imhttp, rollin.data);
     // TODO: the HTTP version is skipped in imhttp_res_status_code()
     sv_chop_by_delim(&status_line, ' ');
     String_View code_sv = sv_chop_by_delim(&status_line, ' ');
     return sv_to_u64(code_sv);
 }
 
+// TODO: Document that imhttp_res_next_header() invalidate name and value on the consequent imhttp_* calls
 bool imhttp_res_next_header(ImHTTP *imhttp, String_View *name, String_View *value)
 {
-    String_View line = sv_chop_by_delim(&imhttp->meta_cursor, '\n');
-    if (!sv_eq(line, SV("\r"))) {
+    imhttp_top_rollin_buffer(imhttp);
+    String_View rollin = imhttp_rollin_buffer_as_sv(imhttp);
+    String_View header_line = sv_chop_by_delim(&rollin, '\n');
+    assert(
+        sv_ends_with(header_line, SV("\r")) &&
+        "The rolling buffer is so small that it could not fit the whole header line. "
+        "Or maybe the header line was not fully read after the imhttp_top_rollin_buffer() "
+        "above");
+    // Transfer the ownership of header_line from rollin_buffer to user_buffer
+    header_line = imhttp_shift_rollin_buffer(imhttp, rollin.data);
+
+    if (!sv_eq(header_line, SV("\r\n"))) {
         // TODO: don't set name/value if the user set them to NULL in imhttp_res_next_header
-        *name = sv_chop_by_delim(&line, ':');
-        *value = sv_trim(line);
+        *name = sv_chop_by_delim(&header_line, ':');
+        *value = sv_trim(header_line);
 
         // TODO: are header case-sensitive?
         if (sv_eq(*name, SV("Content-Length"))) {
@@ -191,25 +212,21 @@ bool imhttp_res_next_body_chunk(ImHTTP *imhttp, String_View *chunk)
     assert(imhttp->content_length >= 0);
 
     if (imhttp->content_length > 0) {
-        if (imhttp->first_chunk) {
-            imhttp->first_chunk = false;
-        } else {
-            ssize_t n = imhttp->read(imhttp->socket, imhttp->res_body_chunk, IMHTTP_RES_BODY_CHUNK_CAPACITY);
-            // TODO: imhttp_res_next_body_chunk does not hande read errors
-            assert(n > 0);
-            imhttp->res_body_chunk_size = n;
-        }
+        imhttp_top_rollin_buffer(imhttp);
+        String_View rollin = imhttp_rollin_buffer_as_sv(imhttp);
+        // TODO: ImHTTP does not handle the situation when the server responded with more data than it claimed with Content-Length
+        assert(rollin.count <= (size_t) imhttp->content_length);
+
+        String_View result = imhttp_shift_rollin_buffer(
+                                 imhttp,
+                                 imhttp->rollin_buffer + imhttp->rollin_buffer_size);
 
         if (chunk) {
-            *chunk = (String_View) {
-                .count = imhttp->res_body_chunk_size,
-                .data = imhttp->res_body_chunk
-            };
+            *chunk = result;
         }
 
-        // TODO: ImHTTP does not handle the situation when the server responded with more data than it claimed with Content-Length
-        assert((int) imhttp->res_body_chunk_size <= imhttp->content_length);
-        imhttp->content_length -= imhttp->res_body_chunk_size;
+        imhttp->content_length -= result.count;
+
         return true;
     }
 
