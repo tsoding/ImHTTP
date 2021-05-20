@@ -15,8 +15,7 @@
 #define IMHTTP_IMPLEMENTATION
 #include "./imhttp.h"
 
-// http://anglesharp.azurewebsites.net/Chunked
-
+// TODO: Sometimes http://anglesharp.azurewebsites.net/Chunked fires the asserts
 #define HOST "anglesharp.azurewebsites.net"
 #define PORT "80"
 
