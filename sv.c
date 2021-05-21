@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -161,6 +162,26 @@ uint64_t sv_to_u64(String_View sv)
     return result;
 }
 
+uint64_t sv_hex_to_u64(String_View sv)
+{
+    uint64_t result = 0;
+    
+    for (size_t i = 0; i < sv.count; ++i) {
+        const char x = sv.data[i];
+        if ('0' <= x && x <= '9') {
+            result = result * 16 + x - '0';
+        } else if ('a' <= x && x <= 'z') {
+            result = result * 16 + x - 'a' + 10;
+        } else if ('A' <= x && x <= 'Z') {
+            result = result * 16 + x - 'A' + 10;
+        } else {
+            assert(false);
+        }
+    }
+
+    return result;
+}
+
 String_View sv_chop_left_while(String_View *sv, bool (*predicate)(char x))
 {
     size_t i = 0;
@@ -169,3 +190,4 @@ String_View sv_chop_left_while(String_View *sv, bool (*predicate)(char x))
     }
     return sv_chop_left(sv, i);
 }
+

@@ -34,6 +34,9 @@ typedef struct {
     char user_buffer[IMHTTP_USER_BUFFER_CAPACITY];
 
     int content_length;
+    bool chunked;
+    size_t chunk_length;
+    bool chunked_done;
 } ImHTTP;
 
 void imhttp_req_begin(ImHTTP *imhttp, ImHTTP_Method method, const char *resource);
@@ -52,6 +55,13 @@ void imhttp_res_end(ImHTTP *imhttp);
 #endif // IMHTTP_H_
 
 #ifdef IMHTTP_IMPLEMENTATION
+
+static void imhttp_drop_rollin_buffer(ImHTTP *imhttp, size_t n)
+{
+    assert(n <= imhttp->rollin_buffer_size);
+    memmove(imhttp->rollin_buffer, imhttp->rollin_buffer + n, n);
+    imhttp->rollin_buffer_size -= n;
+}
 
 static String_View imhttp_shift_rollin_buffer(ImHTTP *imhttp, const char *end)
 {
@@ -154,8 +164,10 @@ void imhttp_req_end(ImHTTP *imhttp)
 
 void imhttp_res_begin(ImHTTP *imhttp)
 {
-    // Reset the Content-Length
     imhttp->content_length = -1;
+    imhttp->chunked = false;
+    imhttp->chunk_length = 0;
+    imhttp->chunked_done = false;
 }
 
 uint64_t imhttp_res_status_code(ImHTTP *imhttp)
@@ -198,6 +210,14 @@ bool imhttp_res_next_header(ImHTTP *imhttp, String_View *name, String_View *valu
         if (sv_eq(*name, SV("Content-Length"))) {
             // TODO: content_length overflow
             imhttp->content_length = sv_to_u64(*value);
+        } else if (sv_eq(*name, SV("Transfer-Encoding"))) {
+            String_View encoding_list = *value;
+            while (encoding_list.count > 0) {
+                String_View encoding = sv_trim(sv_chop_by_delim(&encoding_list, ','));
+                if (sv_eq(encoding, SV("chunked"))) {
+                    imhttp->chunked = true;
+                }
+            }
         }
         return true;
     }
@@ -208,26 +228,70 @@ bool imhttp_res_next_header(ImHTTP *imhttp, String_View *name, String_View *valu
 // TODO: document that the chunk is always invalidated after each imhttp_res_next_body_chunk() call
 bool imhttp_res_next_body_chunk(ImHTTP *imhttp, String_View *chunk)
 {
-    // TODO: ImHTTP can't handle the responses that do not set Content-Length
-    assert(imhttp->content_length >= 0);
+    if (imhttp->chunked) {
+        if (!imhttp->chunked_done) {
+            imhttp_top_rollin_buffer(imhttp);
 
-    if (imhttp->content_length > 0) {
-        imhttp_top_rollin_buffer(imhttp);
-        String_View rollin = imhttp_rollin_buffer_as_sv(imhttp);
-        // TODO: ImHTTP does not handle the situation when the server responded with more data than it claimed with Content-Length
-        assert(rollin.count <= (size_t) imhttp->content_length);
+            if (imhttp->chunk_length == 0) {
+                String_View rollin = imhttp_rollin_buffer_as_sv(imhttp);
+                String_View chunk_length_sv = sv_chop_by_delim(&rollin, '\n');
+                assert(sv_ends_with(chunk_length_sv, SV("\r")) &&
+                       "The rolling buffer is so small that it could not fit the whole chunk length. "
+                       "Or maybe the chunk length was not fully read after the imhttp_top_rollin_buffer() "
+                       "above");
+                imhttp->chunk_length = sv_hex_to_u64(sv_trim(chunk_length_sv));
+                imhttp_shift_rollin_buffer(imhttp, rollin.data);
+            }
 
-        String_View result = imhttp_shift_rollin_buffer(
-                                 imhttp,
-                                 imhttp->rollin_buffer + imhttp->rollin_buffer_size);
+            if (imhttp->chunk_length == 0) {
+                imhttp->chunked_done = true;
+                return false;
+            }
 
-        if (chunk) {
-            *chunk = result;
+            {
+                size_t n = imhttp->chunk_length;
+                if (n > imhttp->rollin_buffer_size) {
+                    n = imhttp->rollin_buffer_size;
+                }
+
+                String_View data = imhttp_shift_rollin_buffer(imhttp, imhttp->rollin_buffer + n);
+                imhttp->chunk_length -= n;
+
+                if (imhttp->chunk_length == 0) {
+                    String_View rollin = imhttp_rollin_buffer_as_sv(imhttp);
+                    assert(sv_starts_with(rollin, SV("\r\n")));
+                    imhttp_drop_rollin_buffer(imhttp, 2);
+                }
+
+                if (chunk) {
+                    *chunk = data;
+                }
+            }
+
+            return true;
         }
+    } else {
+        // TODO: ImHTTP can't handle the responses that do not set Content-Length
+        assert(imhttp->content_length >= 0);
 
-        imhttp->content_length -= result.count;
+        if (imhttp->content_length > 0) {
+            imhttp_top_rollin_buffer(imhttp);
+            String_View rollin = imhttp_rollin_buffer_as_sv(imhttp);
+            // TODO: ImHTTP does not handle the situation when the server responded with more data than it claimed with Content-Length
+            assert(rollin.count <= (size_t) imhttp->content_length);
 
-        return true;
+            String_View result = imhttp_shift_rollin_buffer(
+                                     imhttp,
+                                     imhttp->rollin_buffer + imhttp->rollin_buffer_size);
+
+            if (chunk) {
+                *chunk = result;
+            }
+
+            imhttp->content_length -= result.count;
+
+            return true;
+        }
     }
 
     return false;
